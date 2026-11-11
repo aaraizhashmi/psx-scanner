@@ -66,8 +66,13 @@ def _sess() -> requests.Session:
     return s
 
 
+# Servers seen behind dps.psx.com.pk. The one that serves data is often NOT in
+# DNS, so these are always tried. Add new ones here if PSX moves.
+SEED_IPS = ["52.128.23.16", "52.128.23.6"]
+
+
 def _server_ips(host: str) -> list[str]:
-    ips = []
+    ips = list(SEED_IPS)
     for _ in range(4):  # DNS may rotate addresses between lookups
         try:
             for info in socket.getaddrinfo(host, 443, socket.AF_INET, socket.SOCK_STREAM):
@@ -172,14 +177,20 @@ def get_market_watch() -> pd.DataFrame:
     current, change_pct, volume, shariah (in KMI All Share)."""
     if MOCK:
         return _mock_market_watch()
+    errs = []
     try:
         df = _market_watch_page()
-    except Exception:
+    except Exception as e:
+        errs.append(f"market watch: {e}")
         df = pd.DataFrame()
     if df.empty:
-        df = _market_from_daily_history()
+        try:
+            df = _market_from_daily_history()
+        except Exception as e:
+            errs.append(f"daily table: {e}")
     if df.empty:
-        raise RuntimeError("PSX market data unavailable (market watch and daily history both failed)")
+        raise RuntimeError("PSX market data unavailable. " + " | ".join(errs or ["no rows returned"])
+                           + f" | {server_info()}")
     try:
         kmi = get_shariah_set()
     except Exception:
@@ -198,7 +209,8 @@ def _market_from_daily_history() -> pd.DataFrame:
             continue
         try:
             r = psx("POST", "/historical", data={"date": d.isoformat()})
-        except Exception:
+        except Exception as e:
+            last = e
             continue
         soup = BeautifulSoup(r.text, "html.parser")
         headers = [th.get_text(" ", strip=True).lower() for th in soup.select("th")]
@@ -226,6 +238,8 @@ def _market_from_daily_history() -> pd.DataFrame:
         out = out.dropna(subset=["current"])
         if len(out):
             return out.reset_index(drop=True)
+    if "last" in locals():
+        raise last
     return pd.DataFrame()
 
 
