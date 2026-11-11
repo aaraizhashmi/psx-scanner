@@ -116,7 +116,11 @@ st.caption(f"Updated {now:%a %d %b %Y, %H:%M} PKT · End-of-day data from the PS
 try:
     mw = market_watch()
 except Exception as e:
-    st.error(f"Couldn't load the PSX market watch ({e}). The PSX site may be down or changed. Try Refresh later.")
+    st.error(f"Couldn't load PSX data ({e}).")
+    st.write("Tap the button below and send a screenshot of the result. It checks which PSX server answers.")
+    if st.button("Run connection test"):
+        with st.spinner("Testing PSX servers (about 30 seconds)…"):
+            st.dataframe(D.probe(), use_container_width=True, hide_index=True)
     st.stop()
 
 syms = symbols()
@@ -196,6 +200,8 @@ with st.sidebar.expander("Data status"):
     st.write(f"KSE-100 history: {len(ix)} days")
     st.write(f"PSX server: {D.server_info()}")
     st.caption("If a number here is 0, that PSX page changed or is down.")
+    if st.button("Run connection test", key="probe2"):
+        st.dataframe(D.probe(), use_container_width=True, hide_index=True)
 
 tabs = st.tabs(["🏆 Top picks", "🔎 Stock check", "🌐 Market & flows", "📊 Track record", "ℹ️ How it works"])
 

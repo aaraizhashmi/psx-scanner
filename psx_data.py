@@ -103,18 +103,69 @@ def psx(method: str, path: str, **kw) -> requests.Response:
             if ip == current:
                 continue
             _PIN[_HOST] = ip
-            try:
-                r = _sess().request(method, url, **kw)
-                if r.status_code not in (403, 404):
-                    r.raise_for_status()
-                    return r
-            except requests.RequestException as e:
-                last_exc = e
+            for xhr in (True, False):
+                try:
+                    sess = _sess()
+                    if not xhr:
+                        sess = requests.Session()
+                        sess.headers.update(HEADERS)
+                    r = sess.request(method, url, **kw)
+                    if r.status_code not in (403, 404):
+                        r.raise_for_status()
+                        if not xhr:
+                            _local.s, _local.pin = sess, ip
+                        return r
+                    last_exc = requests.HTTPError(f"{r.status_code} for {url} via {ip}")
+                except requests.RequestException as e:
+                    last_exc = e
         if current:
             _PIN[_HOST] = current
         else:
             _PIN.pop(_HOST, None)
     raise last_exc or RuntimeError(f"PSX request failed: {url}")
+
+
+def probe() -> pd.DataFrame:
+    """Connection test: ask each known PSX server for a data page, with and
+    without the XHR header. Used by the app's diagnostics."""
+    rows = []
+    ips = ["(DNS)"] + _server_ips(_HOST)
+    saved = _PIN.get(_HOST)
+    try:
+        for ip in ips:
+            if ip == "(DNS)":
+                _PIN.pop(_HOST, None)
+            else:
+                _PIN[_HOST] = ip
+            for xhr in (True, False):
+                for path in ("/symbols", "/market-watch"):
+                    s = requests.Session()
+                    s.headers.update(HEADERS)
+                    if xhr:
+                        s.headers["X-Requested-With"] = "XMLHttpRequest"
+                    try:
+                        r = s.get(f"{BASE}{path}", timeout=15)
+                        res = f"{r.status_code} ({len(r.content):,} bytes)"
+                    except Exception as e:
+                        res = type(e).__name__
+                    rows.append({"server": ip, "xhr_header": xhr, "page": path, "result": res})
+                    time.sleep(0.5)
+    finally:
+        if saved:
+            _PIN[_HOST] = saved
+        else:
+            _PIN.pop(_HOST, None)
+    try:
+        dns = socket.gethostbyname(_HOST)
+    except OSError:
+        dns = "?"
+    rows.append({"server": f"DNS now -> {dns}", "xhr_header": "", "page": "", "result": ""})
+    try:
+        ip = requests.get("https://api.ipify.org", timeout=10).text
+    except Exception:
+        ip = "?"
+    rows.append({"server": f"This app's public IP: {ip}", "xhr_header": "", "page": "", "result": ""})
+    return pd.DataFrame(rows)
 
 
 def server_info() -> str:
