@@ -194,6 +194,7 @@ with st.sidebar.expander("Data status"):
     st.write(f"Price histories loaded: {len(hist)} of {len(universe)}")
     st.write(f"Announcements: {len(ann)}")
     st.write(f"KSE-100 history: {len(ix)} days")
+    st.write(f"PSX server: {D.server_info()}")
     st.caption("If a number here is 0, that PSX page changed or is down.")
 
 tabs = st.tabs(["🏆 Top picks", "🔎 Stock check", "🌐 Market & flows", "📊 Track record", "ℹ️ How it works"])

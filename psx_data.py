@@ -28,7 +28,95 @@ PKT = timezone(timedelta(hours=5))
 HEADERS = {"User-Agent": "Mozilla/5.0 (PSX morning scanner; personal use)"}
 MOCK = os.environ.get("PSX_MOCK") == "1"
 
-_session = requests.Session()
+# ----------------------------------------------------- PSX server routing
+# dps.psx.com.pk sits behind several servers. Some answer 404 (or 403) to data
+# pages while others serve them. When that happens we try each server address
+# in turn and stick with the first one that works.
+import socket
+import threading
+import time
+from urllib.parse import urlparse
+
+import urllib3.util.connection as _uc
+
+_HOST = urlparse(BASE).hostname
+_PIN: dict[str, str] = {}          # hostname -> server IP that works
+_orig_create_connection = _uc.create_connection
+
+
+def _pinned_create_connection(address, *args, **kwargs):
+    host, port = address
+    if host in _PIN:
+        address = (_PIN[host], port)
+    return _orig_create_connection(address, *args, **kwargs)
+
+
+_uc.create_connection = _pinned_create_connection
+_local = threading.local()
+_pin_lock = threading.Lock()
+
+
+def _sess() -> requests.Session:
+    s = getattr(_local, "s", None)
+    if s is None or getattr(_local, "pin", None) != _PIN.get(_HOST):
+        s = requests.Session()
+        s.headers.update(HEADERS)
+        s.headers["X-Requested-With"] = "XMLHttpRequest"
+        _local.s, _local.pin = s, _PIN.get(_HOST)
+    return s
+
+
+def _server_ips(host: str) -> list[str]:
+    ips = []
+    for _ in range(4):  # DNS may rotate addresses between lookups
+        try:
+            for info in socket.getaddrinfo(host, 443, socket.AF_INET, socket.SOCK_STREAM):
+                if info[4][0] not in ips:
+                    ips.append(info[4][0])
+        except OSError:
+            pass
+        time.sleep(0.2)
+    return ips
+
+
+def psx(method: str, path: str, **kw) -> requests.Response:
+    """Request a PSX Data Portal path, switching servers on 403/404."""
+    kw.setdefault("timeout", 30)
+    url = f"{BASE}{path}"
+    last_exc = None
+    try:
+        r = _sess().request(method, url, **kw)
+        if r.status_code not in (403, 404):
+            r.raise_for_status()
+            return r
+        last_exc = requests.HTTPError(f"{r.status_code} for {url}")
+    except requests.RequestException as e:
+        last_exc = e
+    with _pin_lock:
+        current = _PIN.get(_HOST)
+        for ip in _server_ips(_HOST):
+            if ip == current:
+                continue
+            _PIN[_HOST] = ip
+            try:
+                r = _sess().request(method, url, **kw)
+                if r.status_code not in (403, 404):
+                    r.raise_for_status()
+                    return r
+            except requests.RequestException as e:
+                last_exc = e
+        if current:
+            _PIN[_HOST] = current
+        else:
+            _PIN.pop(_HOST, None)
+    raise last_exc or RuntimeError(f"PSX request failed: {url}")
+
+
+def server_info() -> str:
+    return f"pinned to {_PIN[_HOST]}" if _HOST in _PIN else "default server"
+
+
+_session = requests.Session()   # used for non-PSX sites (news)
 _session.headers.update(HEADERS)
 
 
@@ -49,8 +137,7 @@ def get_symbols() -> pd.DataFrame:
     """symbol, name, sector for every listed security."""
     if MOCK:
         return _mock_symbols()
-    r = _session.get(f"{BASE}/symbols", timeout=30)
-    r.raise_for_status()
+    r = psx("GET", "/symbols")
     df = pd.DataFrame(r.json())
     df.columns = [c.lower() for c in df.columns]
     out = pd.DataFrame({
@@ -66,13 +153,84 @@ def get_symbols() -> pd.DataFrame:
 
 # ------------------------------------------------------------- market watch
 
+def get_shariah_set() -> set[str]:
+    """Symbols in the KMI All Share index (PSX's Shariah-compliant index)."""
+    r = psx("GET", "/indices/KMIALLSHR")
+    soup = BeautifulSoup(r.text, "html.parser")
+    out = set()
+    for tr in soup.select("table tbody tr"):
+        td = tr.find("td")
+        if td:
+            sym = td.get("data-search") or td.get_text(" ", strip=True)
+            if sym:
+                out.add(re.split(r"\s+", sym.strip())[0].upper())
+    return out
+
+
 def get_market_watch() -> pd.DataFrame:
     """Latest session for every stock: symbol, listed_in, ldcp, open, high, low,
-    current, change, change_pct, volume, shariah (in KMI All Share)."""
+    current, change_pct, volume, shariah (in KMI All Share)."""
     if MOCK:
         return _mock_market_watch()
-    r = _session.get(f"{BASE}/market-watch", timeout=30)
-    r.raise_for_status()
+    try:
+        df = _market_watch_page()
+    except Exception:
+        df = pd.DataFrame()
+    if df.empty:
+        df = _market_from_daily_history()
+    if df.empty:
+        raise RuntimeError("PSX market data unavailable (market watch and daily history both failed)")
+    try:
+        kmi = get_shariah_set()
+    except Exception:
+        kmi = set()
+    if kmi:
+        df["shariah"] = df.symbol.isin(kmi)
+    return df
+
+
+def _market_from_daily_history() -> pd.DataFrame:
+    """Fallback: PSX's all-symbols closing table for the latest trading day."""
+    day = now_pkt().date()
+    for back in range(0, 8):
+        d = day - timedelta(days=back)
+        if d.weekday() >= 5:
+            continue
+        try:
+            r = psx("POST", "/historical", data={"date": d.isoformat()})
+        except Exception:
+            continue
+        soup = BeautifulSoup(r.text, "html.parser")
+        headers = [th.get_text(" ", strip=True).lower() for th in soup.select("th")]
+        rows = []
+        for tr in soup.select("tr"):
+            cells = [td.get_text(" ", strip=True) for td in tr.select("td")]
+            if cells and len(cells) == len(headers):
+                rows.append(dict(zip(headers, cells)))
+        if not rows:
+            continue
+        df = pd.DataFrame(rows)
+        col = lambda *ks: next((df[c] for c in df.columns for k in ks if c.startswith(k)), pd.Series([np.nan] * len(df)))
+        out = pd.DataFrame({
+            "symbol": col("symbol").astype(str).str.split().str[0].str.upper(),
+            "listed_in": "",
+            "ldcp": col("ldcp").map(_num),
+            "open": col("open").map(_num),
+            "high": col("high").map(_num),
+            "low": col("low").map(_num),
+            "current": col("close", "current").map(_num),
+            "volume": col("volume").map(_num),
+        })
+        out["change_pct"] = (out.current / out.ldcp - 1) * 100
+        out["shariah"] = False
+        out = out.dropna(subset=["current"])
+        if len(out):
+            return out.reset_index(drop=True)
+    return pd.DataFrame()
+
+
+def _market_watch_page() -> pd.DataFrame:
+    r = psx("GET", "/market-watch")
     soup = BeautifulSoup(r.text, "html.parser")
     table = soup.find("table")
     if table is None:
@@ -114,9 +272,7 @@ def get_market_watch() -> pd.DataFrame:
 # ------------------------------------------------------------ daily history
 
 def _month_history(symbol: str, year: int, month: int) -> pd.DataFrame:
-    r = _session.post(f"{BASE}/historical", data={"month": month, "year": year, "symbol": symbol},
-                      timeout=30)
-    r.raise_for_status()
+    r = psx("POST", "/historical", data={"month": month, "year": year, "symbol": symbol})
     soup = BeautifulSoup(r.text, "html.parser")
     headers = [th.get_text(strip=True).upper() for th in soup.select("th")]
     rows = []
@@ -163,7 +319,7 @@ def get_history(symbol: str, months: int = 6) -> pd.DataFrame:
     return df
 
 
-def get_histories(symbols: list[str], months: int = 6, workers: int = 8, progress=None) -> dict:
+def get_histories(symbols: list[str], months: int = 6, workers: int = 4, progress=None) -> dict:
     out = {}
     with ThreadPoolExecutor(max_workers=workers) as ex:
         futs = {ex.submit(get_history, s, months): s for s in symbols}
@@ -187,8 +343,7 @@ def get_index_history(index: str = "KSE100") -> pd.DataFrame:
     if MOCK:
         d = _mock_history(index, base=170000, vol=3e8)
         return d[["Close", "Volume"]]
-    r = _session.get(f"{BASE}/timeseries/eod/{index}", timeout=30)
-    r.raise_for_status()
+    r = psx("GET", f"/timeseries/eod/{index}")
     data = r.json().get("data", [])
     if not data:
         return pd.DataFrame()
@@ -200,27 +355,40 @@ def get_index_history(index: str = "KSE100") -> pd.DataFrame:
 
 # --------------------------------------------------------- announcements
 
-def get_announcements() -> pd.DataFrame:
+def get_announcements(days: int = 3) -> pd.DataFrame:
     """Recent company announcements: date, symbol, title."""
     if MOCK:
         return _mock_announcements()
-    r = _session.get(f"{BASE}/announcements/companies", timeout=30)
-    r.raise_for_status()
-    soup = BeautifulSoup(r.text, "html.parser")
-    table = soup.find("table")
-    if table is None:
-        return pd.DataFrame()
-    headers = [th.get_text(" ", strip=True).lower() for th in table.select("thead th")]
-    rows = [dict(zip(headers, [td.get_text(" ", strip=True) for td in tr.find_all("td")]))
-            for tr in table.select("tbody tr")]
+    today = now_pkt().date()
+    r = psx("POST", "/announcements", data={
+        "type": "C", "symbol": "", "query": "", "count": 200, "offset": 0,
+        "date_from": (today - timedelta(days=days)).isoformat(), "date_to": today.isoformat(),
+        "page": "annc"})
+    text = r.text
+    try:  # some responses are JSON-wrapped HTML
+        j = r.json()
+        text = j.get("html") or j.get("data") or text if isinstance(j, dict) else text
+        if not isinstance(text, str):
+            text = r.text
+    except ValueError:
+        pass
+    soup = BeautifulSoup(text, "html.parser")
+    headers = [th.get_text(" ", strip=True).lower() for th in soup.select("th")]
+    rows = []
+    for tr in soup.select("tr"):
+        cells = [td.get_text(" ", strip=True) for td in tr.find_all("td")]
+        if cells:
+            rows.append(dict(zip(headers, cells)) if headers else dict(enumerate(cells)))
     df = pd.DataFrame(rows)
-    pick = lambda key: next((c for c in df.columns if key in c), None)
+    if df.empty:
+        return df
+    pick = lambda key: next((c for c in df.columns if isinstance(c, str) and key in c), None)
     c_date, c_sym, c_title = pick("date"), pick("symbol"), pick("title")
     if not (c_sym and c_title):
         return pd.DataFrame()
     return pd.DataFrame({
         "date": df[c_date] if c_date else "",
-        "symbol": df[c_sym].str.upper().str.strip(),
+        "symbol": df[c_sym].astype(str).str.upper().str.strip(),
         "title": df[c_title],
     })
 
